@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import signal
+
+import subprocess
+
+import json
+# 'compact' format json encode (no spaces)
+json_enc = json.JSONEncoder(separators=(",",":")).encode
+
+
+if 'pytest' in sys.modules:
+    import base_measure as measure
+else:
+    import measure
+
+import util
+from util import run_and_track
+
+MY_VERSION = "aggregator 1.1"
+DRIVERS_DIR = "measure.d"
+DESC = "measure aggregator, runs all drivers in ./measure.d/"
+
+def run(path, *args, data = None):
+
+    if data:
+        data = json_enc(data).encode("UTF-8")
+    r = subprocess.check_output([path]+list(args), input = data)
+
+    return json.loads(r.decode("UTF-8"))
+
+
+def locate_drivers():
+    drivers = []
+    for e in os.listdir(DRIVERS_DIR):
+        p = os.path.join(DRIVERS_DIR,e)
+        if not (os.path.isfile(p) and os.access(p, os.X_OK)):
+            continue
+        info = run(p, "--info") # may raise an exception
+        drivers.append( (p, info) ) 
+        drivers.sort() # by the relative path, which by construction is simply 'by file name' here
+
+    return drivers
+
+
+def _version():
+    ver = MY_VERSION
+    dvers = ", ".join( [info["version"] for d,info in drivers] )
+    return "{} ({})".format(ver, dvers)
+
+
+def info():
+    ver = _version()
+    has_cancel = all( ( info.get("has_cancel", False)  for d,info in drivers ) )
+
+    print (json_enc( { "version":ver, "has_cancel":has_cancel } ))
+
+
+g_state = {} # saved --describe output from each driver
+g_metrics = {} # saved --describe metric key to driver associations, used for bucketing input
+
+def merge_dict_error_duplicate(dest, src):
+    """merge src into dest, raise exception if the
+    same metric is defined in both"""
+
+    for n,v in src.items():
+        if n in dest:
+            raise ValueError(n)
+        dest[n] = v
+
+    return
+
+def _print_measure_error(err, code=500):
+        '''
+        Prints JSON formatted error to stdout
+        Takes an error message as string
+        '''
+        out = {
+            "status": code,
+            "reason": err,
+        }
+        print(json.dumps(out), flush=True)
+
+def _describe(app_id='app'):
+    metrics = {}
+
+    # first, read and save
+    for d,_ in drivers:
+        #
+        q = run(d, '--describe', app_id)
+        g_state[d] = q
+
+    # merge after all data is collected
+    for d,_ in drivers:
+        try:
+            merge_dict_error_duplicate(metrics, g_state[d].get('metrics', {}))
+            for m in g_state[d].get('metrics', {}).keys():
+                g_metrics[m] = d
+        except ValueError as x:
+            # re-raise with context info
+            # NOTE we don't keep track where the first one came from, just report the current driver as the culprit
+            raise ValueError("{}: describe returned duplicate metric: {}".format(os.path.basename(d), str(x)))
+
+    return metrics
+
+def _measure(app_id, input_data):
+    _ = _describe()
+    try:
+        in_metrics = input_data['metrics']
+    except:
+        raise Exception('Input configuration is missing "metrics"')
+    if not in_metrics or not isinstance(in_metrics, list):
+        raise Exception('Invalid input; metrics must be list of metric IDs contained in configuration. found: {}'.format(in_metrics))
+
+    # parse input metrics into buckets based on driver handling them
+    d_input = dict()
+    no_driver_metrics = []
+    for m in in_metrics:
+        if g_metrics.get(m):
+            d_input.setdefault(g_metrics[m], []).append(m)
+        else:
+            no_driver_metrics.append(m)
+
+    if no_driver_metrics:
+        _print_measure_error("{}: measurement input contained unknown metric(s): {}".format(', '.join([os.path.basename(d) for d, _ in drivers]), ', '.join(no_driver_metrics)))
+
+
+    # progress ratios - assume all driver have equal weight
+    p = 1.0/float(len(d_input))
+    p_weight = { d:p for d in d_input.keys() }
+    p_progress = { d:0.0 for d in d_input.keys() }
+    m_state = {}
+
+    def cbk(driver, args):
+        try:
+            p = args["progress"]
+        except KeyError:
+            return # nothing to do
+        p = float(p)/100.0
+        p_progress[driver] = p
+        total = int ( sum( (v * p_weight[k] for k,v in p_progress.items()) ) * 100.0 )
+        if total>100: total = 100
+        print ( json_enc( {"progress": total} ), flush = True )
+
+    for d in sorted(d_input.keys()):
+        m = run_and_track(d, app_id, progress_cb = lambda args: cbk(d, args), data = { 'metrics': d_input[d] } )
+        m_state[d] = m
+        cbk(d, {"progress":100} )
+
+    # merge after all data is collected
+    metrics = {}
+    annotations = {}
+    for d, mesVal in m_state.items():
+        if (not mesVal.get('status')) or mesVal['status'] != 'ok':
+            _print_measure_error('Driver {} measure failed or output malformed: {}'.format(d, mesVal))
+            continue
+
+        try:
+            merge_dict_error_duplicate(metrics, mesVal.get('metrics', {}))
+        except ValueError as x:
+            # re-raise with context info
+            # NOTE we don't keep track where the first one came from, just report the current driver as the culprit
+            raise ValueError("{}: measure returned duplicate for metric name: {}".format(os.path.basename(d), str(x)))
+
+        if mesVal.get('annotations'):
+            try:
+                merge_dict_error_duplicate(annotations, mesVal['annotations'])
+            except ValueError as x:
+                # error message, assuming annotations are not critical to servo function
+                _print_measure_error("{}: measure returned duplicate for annotation name: {}".format(os.path.basename(d), str(x)))
+
+    return metrics, annotations
+
+class M(measure.Measure):
+
+    def describe(self):
+        return _describe(self.app_id)
+
+    def measure(self):
+        return _measure(self.app_id, self.input_data)
+
+    def info(self):
+        ver = self.version # _version() - already set on obj create
+        has_cancel = all( ( info.get("has_cancel", False)  for d,info in drivers ) )
+        return { "version":ver, "has_cancel":has_cancel }
+
+def sigusr1(num, frame):
+    util.run_and_track_cancel()
+    sys.exit(1)
+
+def terminate(num, frame):
+    util.run_and_track_terminate()
+    sys.exit(1)
+
+def _init_and_run():
+    os.environ["PYTHONPATH"] = os.getcwd() # TODO: append to the path, in case it is set
+    global drivers
+    drivers = locate_drivers()
+    # print(drivers)
+
+    oldterm = signal.signal(signal.SIGTERM, terminate)
+    oldint = signal.signal(signal.SIGINT, terminate)
+
+    if all( ( info.get("has_cancel", False)  for d,info in drivers ) ):
+        signal.signal(signal.SIGUSR1, sigusr1)
+
+    i = M(_version(), DESC, False)
+    i.run()
+
+drivers = []
+if __name__ == "__main__":
+    _init_and_run()
